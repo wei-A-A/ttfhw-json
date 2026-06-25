@@ -1,7 +1,7 @@
 name: JSON Quality Gate
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize]
     paths:
       - 'reports/**/*.json'
@@ -18,10 +18,22 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      # Step 1: Checkout base branch (main) to get TRUSTED validation scripts.
+      # Scripts from base are safe — we never execute code from the PR.
+      - name: Checkout base (trusted scripts)
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.base_ref }}
+          path: base
+
+      # Step 2: Checkout PR head to get JSON files for validation.
+      # Only JSON data is read from here; no scripts from PR are executed.
+      - name: Checkout PR (JSON data)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          path: pr
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -31,33 +43,38 @@ jobs:
       - name: Install dependencies
         run: pip install openai
 
+      # Use changed-files on the PR checkout to identify which JSONs were modified
       - name: Get changed JSON files
         id: changed-files
         uses: tj-actions/changed-files@v44
         with:
           files: reports/**/*.json
           files_separator: ' '
+          path: pr
 
       - name: Skip if no JSON changes
         if: steps.changed-files.outputs.any_changed != 'true'
         run: |
           echo "No JSON files changed. Skipping quality checks."
 
+      # Run TRUSTED scripts from base/ on PR's JSON files
       - name: Run deterministic validation
         if: steps.changed-files.outputs.any_changed == 'true'
         id: validate
+        working-directory: pr
         run: |
-          python3 scripts/validate_json.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/deterministic_results.json
+          python3 ../base/scripts/validate_json.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/deterministic_results.json
           cat /tmp/deterministic_results.json
 
       - name: Run AI semantic analysis
         if: steps.changed-files.outputs.any_changed == 'true'
         id: ai-check
         continue-on-error: true
+        working-directory: pr
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
-          python3 scripts/ai_quality_check.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/ai_results.json
+          python3 ../base/scripts/ai_quality_check.py ${{ steps.changed-files.outputs.all_changed_files }} > /tmp/ai_results.json
           cat /tmp/ai_results.json
 
       - name: Post results as Check Run and PR comment
@@ -67,7 +84,6 @@ jobs:
           script: |
             const fs = require('fs');
 
-            // Read deterministic results
             let detResults = { pass: true, files: {} };
             try {
               detResults = JSON.parse(fs.readFileSync('/tmp/deterministic_results.json', 'utf8'));
@@ -75,7 +91,6 @@ jobs:
               console.log('Failed to read deterministic results:', e.message);
             }
 
-            // Read AI results (may not exist)
             let aiResults = { pass: true, files: {} };
             try {
               aiResults = JSON.parse(fs.readFileSync('/tmp/ai_results.json', 'utf8'));
@@ -83,15 +98,12 @@ jobs:
               console.log('AI results not available:', e.message);
             }
 
-            // Merge all issues
             const allFiles = new Set();
             for (const f of Object.keys(detResults.files)) allFiles.add(f);
             for (const f of Object.keys(aiResults.files)) allFiles.add(f);
 
             const findings = {};
-            let totalErrors = 0;
-            let totalWarnings = 0;
-            let totalNotices = 0;
+            let totalErrors = 0, totalWarnings = 0, totalNotices = 0;
             const annotations = [];
 
             for (const file of allFiles) {
@@ -105,8 +117,7 @@ jobs:
                 else if (issue.severity === 'warning') totalWarnings++;
                 else totalNotices++;
 
-                // Create check run annotation (start_line/end_line required by GitHub API)
-                const annotation = {
+                annotations.push({
                   path: file,
                   start_line: 1,
                   end_line: 1,
@@ -115,12 +126,11 @@ jobs:
                   title: issue.path || '$',
                   message: issue.message,
                   raw_details: issue.suggestion || '',
-                };
-                annotations.push(annotation);
+                });
               }
             }
 
-            // Create Check Run (may fail on fork PRs where checks:write is denied)
+            // Create Check Run — pull_request_target has full checks:write permission
             const conclusion = totalErrors > 0 ? 'failure' :
                               totalWarnings > 0 ? 'neutral' : 'success';
 
@@ -128,30 +138,25 @@ jobs:
               ? `${totalErrors} 个错误, ${totalWarnings} 个警告, ${totalNotices} 个提示`
               : '所有检查通过';
 
-            let checkRunCreated = false;
-            try {
-              await github.rest.checks.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name: 'JSON Quality Gate',
-                head_sha: context.payload.pull_request.head.sha,
-                status: 'completed',
-                conclusion: conclusion,
-                completed_at: new Date().toISOString(),
-                output: {
-                  title: checkTitle,
-                  summary: `已检查 ${allFiles.size} 个文件的 JSON 质量问题。\n\n` +
-                           `- **确定性检查**：${Object.keys(detResults.files).length} 个文件\n` +
-                           `- **AI 语义分析**：${Object.keys(aiResults.files).length} 个文件${aiResults.error ? ' (部分可用)' : ''}\n\n` +
-                           `此为**建议性**门禁 — 发现的问题不会阻止代码合入。`,
-                  annotations: annotations.slice(0, 50),
-                },
-              });
-              checkRunCreated = true;
-            } catch (checkErr) {
-              console.log('Check Run 创建失败（fork PR 不支持 checks:write 权限）: ' + checkErr.message);
-              console.log('验证结果将通过 PR 评论展示');
-            }
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'JSON Quality Gate',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion: conclusion,
+              completed_at: new Date().toISOString(),
+              output: {
+                title: checkTitle,
+                summary: `已检查 ${allFiles.size} 个文件的 JSON 质量问题。\n\n` +
+                         `- **确定性检查**：${Object.keys(detResults.files).length} 个文件\n` +
+                         `- **AI 语义分析**：${Object.keys(aiResults.files).length} 个文件${aiResults.error ? ' (部分可用)' : ''}\n\n` +
+                         `此为**建议性**门禁 — 发现的问题不会阻止代码合入。`,
+                annotations: annotations.slice(0, 50),
+              },
+            });
+
+            console.log('Check Run created successfully');
 
             // Build Chinese PR comment
             let commentBody = '## 🔍 JSON 质量门禁检查结果\n\n';
@@ -175,7 +180,6 @@ jobs:
               const fileName = file.replace(/^reports\//, '');
               commentBody += `### 📄 ${fileName}\n\n`;
 
-              // Group by severity
               const errors = fileIssues.filter(i => i.severity === 'error');
               const warnings = fileIssues.filter(i => i.severity === 'warning');
               const notices = fileIssues.filter(i => i.severity === 'notice');
@@ -214,7 +218,6 @@ jobs:
               `(https://github.com/${context.repo.owner}/${context.repo.repo}/actions) 自动生成\n`;
             commentBody += 'ℹ️ 此为**建议性**检查 — 发现的问题不会阻止代码合入。';
 
-            // Find and update existing comment, or create new one
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
